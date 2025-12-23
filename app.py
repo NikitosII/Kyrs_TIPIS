@@ -57,27 +57,54 @@ def extract_numeric_advanced(value):
 
 # Функция для предобработки данных
 def preprocess_input(data_dict, label_encoders):
-    """Преобразует входные данные в формат для модели"""
+    """Преобразует входные данные в формат для модели с обработкой NaN"""
     df_input = pd.DataFrame([data_dict])
     
     # Извлечение марки из названия
     df_input['brand'] = df_input['name'].str.split().str[0]
     
     # Группировка редких брендов
-    known_brands = list(label_encoders['brand'].classes_)
-    df_input['brand'] = df_input['brand'].apply(
-        lambda x: x if x in known_brands else 'Other'
+    try:
+        known_brands = list(label_encoders['brand'].classes_)
+        df_input['brand'] = df_input['brand'].apply(
+            lambda x: x if x in known_brands else 'Other'
+        )
+    except:
+        df_input['brand'] = 'Other'
+    
+    #  обработка числовых полей
+    def safe_extract_numeric(value, default=0.0):
+        """Безопасное извлечение числа"""
+        try:
+            result = extract_numeric_advanced(value)
+            if pd.isna(result):
+                return default
+            return result
+        except:
+            return default
+    
+    df_input['mileage'] = df_input['mileage'].apply(
+        lambda x: safe_extract_numeric(x, default=15.0)  # среднее значение
     )
     
-    # Обработка числовых полей
-    df_input['mileage'] = df_input['mileage'].apply(extract_numeric_advanced)
-    df_input['engine'] = df_input['engine'].apply(extract_numeric_advanced)
+    df_input['engine'] = df_input['engine'].apply(
+        lambda x: safe_extract_numeric(x, default=1200.0)  # среднее значение
+    )
+    
+    # Проверка и исправление некорректных значений
+    df_input['year'] = pd.to_numeric(df_input['year'], errors='coerce')
+    df_input['km_driven'] = pd.to_numeric(df_input['km_driven'], errors='coerce')
+    
+    # Заполнение пропусков средними значениями
+    df_input['year'] = df_input['year'].fillna(2015)
+    df_input['km_driven'] = df_input['km_driven'].fillna(50000)
     
     # Создание признака возраста
     current_year = datetime.now().year
     df_input['car_age'] = current_year - df_input['year']
+    df_input['car_age'] = df_input['car_age'].clip(lower=0, upper=50)  # ограничение
     
-    # Создание интерактивных признаков
+    # Создание интерактивных признаков 
     df_input['age_mileage_ratio'] = df_input['car_age'] / (df_input['mileage'] + 1)
     
     # Кодирование категориальных переменных
@@ -85,10 +112,11 @@ def preprocess_input(data_dict, label_encoders):
         'First Owner': 0,
         'Second Owner': 1,
         'Third Owner': 2,
-        'Fourth & Above Owner': 3
+        'Fourth & Above Owner': 3,
+        None: 1,  # для пропущенных значений
+        '': 1
     }
-    df_input['owner_encoded'] = df_input['owner'].map(owner_mapping)
-    df_input['owner_encoded'] = df_input['owner_encoded'].fillna(1)  # медианное значение
+    df_input['owner_encoded'] = df_input['owner'].map(owner_mapping).fillna(1)
     
     # Частотное кодирование для fuel
     fuel_freq = {
@@ -98,18 +126,22 @@ def preprocess_input(data_dict, label_encoders):
         'LPG': 0.003,
         'Electric': 0.001
     }
-    df_input['fuel_freq'] = df_input['fuel'].map(fuel_freq)
-    df_input['fuel_freq'] = df_input['fuel_freq'].fillna(0.598)
+    df_input['fuel_freq'] = df_input['fuel'].map(fuel_freq).fillna(0.598)
     
     # Label Encoding для других категориальных признаков
-    for col in ['seller_type', 'transmission', 'brand']:
-        le = label_encoders[col]
-        # Для неизвестных значений используем наиболее частый класс
-        known_classes = set(le.classes_)
-        df_input[col] = df_input[col].apply(lambda x: x if x in known_classes else le.classes_[0])
-        df_input[col + '_encoded'] = le.transform(df_input[col])
+    categorical_cols = ['seller_type', 'transmission', 'brand']
+    for col in categorical_cols:
+        le = label_encoders.get(col)
+        if le is not None:
+            known_classes = set(le.classes_)
+            df_input[col] = df_input[col].apply(
+                lambda x: x if x in known_classes else le.classes_[0]
+            )
+            df_input[col + '_encoded'] = le.transform(df_input[col])
+        else:
+            df_input[col + '_encoded'] = 0
     
-    # Выбор финальных признаков (без price_per_km, так как это целевая переменная)
+    # Выбор финальных признаков 
     final_features = [
         'year', 'km_driven', 'mileage', 'engine', 'car_age',
         'owner_encoded', 'fuel_freq',
@@ -117,12 +149,24 @@ def preprocess_input(data_dict, label_encoders):
         'age_mileage_ratio'
     ]
     
-    # Создание DataFrame с финальными признаками
+    # Проверка на NaN и заполнение
     X = df_input[final_features].copy()
+    
+    # Заполнение оставшихся NaN медианными значениями
+    for col in X.columns:
+        if X[col].isnull().any():
+            if X[col].dtype in ['float64', 'int64']:
+                X[col] = X[col].fillna(X[col].median())
+            else:
+                X[col] = X[col].fillna(0)
     
     # Масштабирование числовых признаков
     numeric_features = ['year', 'km_driven', 'mileage', 'engine', 'car_age', 'age_mileage_ratio']
     X_scaled = X.copy()
+    
+    # Проверяем, что все числовые признаки есть
+    numeric_features = [f for f in numeric_features if f in X_scaled.columns]
+    
     X_scaled[numeric_features] = scaler.transform(X[numeric_features])
     
     return X_scaled
@@ -141,7 +185,7 @@ with tab1:
         st.write("### Preview of uploaded data")
         st.dataframe(df_uploaded.head(), use_container_width=True)
         
-        if st.button("🚀 Predict Prices", type="primary"):
+        if st.button("Predict Prices", type="primary"):
             try:
                 predictions = []
                 progress_bar = st.progress(0)
@@ -171,7 +215,7 @@ with tab1:
                 # Кнопка для скачивания результатов
                 csv = df_result.to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    label="📥 Download Predictions as CSV",
+                    label="Download Predictions as CSV",
                     data=csv,
                     file_name='car_predictions.csv',
                     mime='text/csv',
@@ -199,7 +243,7 @@ with tab2:
         mileage = st.text_input("Mileage (e.g., '18.0 kmpl')", "18.0 kmpl")
         engine = st.text_input("Engine (e.g., '1197 CC')", "1197 CC")
     
-    if st.button("🔮 Predict Price", type="primary"):
+    if st.button("Predict Price", type="primary"):
         if model is None:
             st.error("Model not loaded. Please check model artifacts.")
         else:
@@ -225,7 +269,7 @@ with tab2:
                 
                 # Отображение результата
                 st.markdown("---")
-                st.subheader("🎯 Prediction Result")
+                st.subheader("Prediction Result")
                 
                 col_pred1, col_pred2 = st.columns([1, 2])
                 
